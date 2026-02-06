@@ -409,6 +409,71 @@ static void fwDescPool_DefragFull(void* self)
 	fwBaseEntityContainer_UpdateDataHandleCacheForAll();
 }
 
+namespace HashInitU16Fix
+{
+	// 32-bit version of the hash next-prime-size function (original is uint16-limited)
+	static uint32_t HashNextSize32(uint32_t s)
+	{
+		static const uint32_t primes[] = {
+			11, 29, 59, 107, 191, 331, 563, 953, 1609, 2729,
+			4621, 7841, 13297, 22571, 38351, 65167, 65521,
+			104729, 175447, 262147, 393241, 524309, 786433,
+			1048583, 1572869, 2097169
+		};
+		for (uint32_t p : primes)
+		{
+			if (s <= p) return p;
+		}
+		return s | 1;
+	}
+
+	// Original function pointer
+	// Signature: void HashTableInit(void* hashTable, uint32_t poolSize)
+	// RCX = hash table struct pointer, EDX = pool size
+	static void (*g_origHashTableInit)(void* hashTable, uint32_t poolSize);
+
+	static void HashTableInitWrap(void* hashTable, uint32_t poolSize)
+	{
+		// Calculate hash table size using 32-bit math (no uint16 truncation)
+		uint32_t hashSize = HashNextSize32(poolSize / 4);
+
+		// Allocate hash chain heads: hashSize * sizeof(uint32_t)
+		uint32_t* hashHeads = (uint32_t*)operator new((size_t)hashSize * 4);
+
+		// Allocate buckets: poolSize * 12 bytes (each Bucket = {u32 key, u32 value, u32 next})
+		void* buckets = operator new((size_t)poolSize * 12);
+
+		// Store into hash table struct
+		*(void**)((char*)hashTable + 0x00) = buckets;       // bucket array
+		*(uint32_t**)((char*)hashTable + 0x08) = hashHeads;  // hash chain heads
+		*(uint32_t*)((char*)hashTable + 0x10) = hashSize;    // hash chain head count
+
+		memset(hashHeads, 0xFF, (size_t)hashSize * 4);
+		memset(buckets, 0, (size_t)poolSize * 12);
+
+		*(uint32_t*)((char*)hashTable + 0x14) = 0;          // entryCount
+
+		// Build free list: each bucket's .next (offset +8 within Bucket) points to next free index
+		uint32_t lastIdx = poolSize - 1;
+		for (uint32_t i = 0; i < lastIdx; i++)
+		{
+			*(uint32_t*)((char*)buckets + (size_t)i * 12 + 8) = i + 1;
+		}
+		// Last bucket terminates the free list
+		*(uint32_t*)((char*)buckets + (size_t)lastIdx * 12 + 8) = 0xFFFFFFFF;
+
+		*(uint32_t*)((char*)hashTable + 0x18) = 0;          // firstFreeBucket
+
+		if (poolSize > 65535)
+		{
+			trace("HashInitU16Fix: Hash table init - poolSize: %u, hashSize: %u (32-bit)\n",
+				poolSize, hashSize);
+		}
+	}
+}
+
+// ============================================================================
+
 static HookFunction hookFunction([] ()
 {
 	auto generateAndCallStub = [](hook::pattern_match match, int callOffset, uint32_t hash, bool isAssetStore)
@@ -527,6 +592,25 @@ static HookFunction hookFunction([] ()
 	//hook::jump(0x14106B3D0, 0x14106B3B0); // st
 	//hook::jump(0x1410A1CDC, 0x1410A1CC0); // m108, st dependency
 	//hook::nop(0x141056E6F, 5);
+
+	// This function calculates hash size via a uint16-limited next-prime function, causing truncation
+	// Signature: void HashTableInit(void* hashTable, uint32_t poolSize)
+	{
+		auto hashTableInitPattern = hook::pattern("48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC 20 B8 F1 FF 00 00");
+
+		if (!hashTableInitPattern.empty())
+		{
+			auto addr = hashTableInitPattern.get_first<void>();
+			trace("HashInitU16Fix: Found hash table init at %p\n", addr);
+
+			MH_CreateHook(addr, HashInitU16Fix::HashTableInitWrap, (void**)&HashInitU16Fix::g_origHashTableInit);
+			trace("HashInitU16Fix: Hook installed successfully\n");
+		}
+		else
+		{
+			trace("HashInitU16Fix: ERROR - hash table init pattern not found\n");
+		}
+	}
 
 	MH_EnableHook(MH_ALL_HOOKS);
 
